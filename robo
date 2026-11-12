@@ -1,0 +1,675 @@
+#include <Adafruit_TCS34725.h>
+#include <Wire.h>
+#include <Servo.h>
+
+// =====================================================================
+//  MUDANÇAS EM RELAÇÃO À VERSÃO ANTERIOR (procure por [NOVO] / [ALTERADO])
+//  1. Prata: média de leituras do A0 + confirmações espaçadas no tempo
+//  2. Verde/vermelho: detecção por proporção (%) e descarte do preto
+//  3. Cooldowns separados para cores e para prata
+//  4. Avanço curto após ver a primeira cor (ajuda a pegar os 2 verdes)
+//  5. Cruzamento sem verde (E1 e D1 no preto): segue reto (configurável)
+//  6. Giros terminam quando o sensor de linha acha o preto (com tempo máximo)
+//  7. Timeout no I2C, checagem dos sensores de cor e MODO_DEBUG p/ calibrar
+// =====================================================================
+
+// [NOVO] Coloque 1 para calibrar: o robô fica parado e imprime as leituras
+#define MODO_DEBUG 0
+
+// ================== CONFIGURAÇÕES ==================
+#define endereco_multiplexador 0x70
+
+// --- SERVOS DE MOVIMENTO ---
+#define pino_servo_esquerdo 3
+#define pino_servo_direito 2
+
+#define servo_esquerdo_frente 100
+#define servo_esquerdo_tras 80
+#define servo_esquerdo_parado 90
+
+#define servo_direito_frente 78
+#define servo_direito_tras 102
+#define servo_direito_parado 90
+
+// --- VELOCIDADE PARA CURVAS (giros de 90/180 e desvio) ---
+#define servo_esquerdo_curva_frente 135
+#define servo_esquerdo_curva_tras 45
+
+#define servo_direito_curva_frente 45
+#define servo_direito_curva_tras 135
+
+// --- [NOVO] VELOCIDADE DAS CORREÇÕES AO SEGUIR LINHA ---
+// Começam iguais às de curva (comportamento idêntico ao anterior).
+// Para um seguimento mais suave, teste deixar a roda de dentro parada:
+//   linha_esq_servoE 90  /  linha_dir_servoD 90
+#define linha_esq_servoE 45    // correção p/ esquerda: servo esquerdo
+#define linha_esq_servoD 45    // correção p/ esquerda: servo direito
+#define linha_dir_servoE 135   // correção p/ direita: servo esquerdo
+#define linha_dir_servoD 135   // correção p/ direita: servo direito
+
+// [NOVO] true = segue reto quando E1 e D1 veem preto juntos (regra da OBR
+// para cruzamento sem verde). false = comportamento antigo (vira para o
+// lado da última correção).
+#define cruzamento_segue_reto true
+
+// --- SERVO DA GARRA (360 GRAUS) ---
+#define pino_servo_garra 6
+
+// --- SENSOR ULTRASSÔNICO (OBSTÁCULOS OBR) ---
+#define pino_trig 10
+#define pino_echo 11
+#define distancia_obstaculo 12       // Distância (em cm) para iniciar o desvio
+
+// --- TEMPOS DO DESVIO DE OBSTÁCULO (CALIBRADOS PARA CAIXA DE 12cm L x 10cm G) ---
+#define tempo_desvio_giro_90 480
+#define tempo_desvio_lado 1100
+#define tempo_desvio_frente 1600
+#define tempo_busca_linha_max 2500
+
+// --- TEMPOS DE CONFIRMAÇÃO DE COR ---
+#define tempo_avanco_cor 80          // [NOVO] anda mais um pouco após ver a 1ª cor (0 desliga)
+#define tempo_confirmar_cor 750      // Tempo (ms) parado em cima da cor confirmando
+#define intervalo_amostra_cor 100
+#define leituras_minimas_cor 3
+
+// --- [ALTERADO] GIROS: tempo "cego" + giro até achar a linha + tempo máximo ---
+#define tempo_giro_cego_90 250       // gira sem olhar o sensor (sai da linha atual)
+#define tempo_giro_max_90 600        // segurança: para mesmo sem achar a linha (antes: 480 fixo)
+#define tempo_giro_cego_180 800      // passa pelas linhas laterais sem parar nelas
+#define tempo_giro_max_180 1400      // segurança (antes: 1100 fixo)
+
+// --- TEMPOS E DELAYS GERAIS ---
+#define tempo_parada 200
+#define tempo_escapar_verde 250      // usado para sair de cima do vermelho
+#define tempo_cego_cores 1000        // cooldown das cores
+#define tempo_cego_prata 1000        // [NOVO] cooldown da prata (independente)
+#define delay_fita_reflexiva 800
+
+// --- PINOS DOS SENSORES DE LINHA E RESGATE ---
+#define E1 4
+#define D1 5
+#define pino_sensor_resgate A0     // Sensor analógico central
+
+// --- CANAIS DO MULTIPLEXADOR ---
+#define canal_esquerdo 1
+#define canal_direito 0
+
+// --- PRATA (A0) ---
+// Fita Prata = 23 | Branco/Cores = 27 a 29
+// ATENÇÃO: essa diferença é muito pequena. Se puder, ajuste a altura do
+// sensor / resistor para o branco ficar perto do meio da faixa (300 a 600)
+// e recalibre este limiar com o MODO_DEBUG.
+#define limiar_a0_prata 24
+#define amostras_media_a0 8          // [NOVO] leituras por média
+#define intervalo_amostra_prata 10   // [NOVO] ms entre confirmações
+#define leituras_minimas_prata 4     // [NOVO] confirmações seguidas (antes: 3 instantâneas)
+
+// --- [NOVO] LIMITES DE COR (calibrar com MODO_DEBUG) ---
+#define c_min_cor 150        // C abaixo disso = preto, ignora
+#define c_max_cor 650        // C acima disso = branco, ignora
+#define verde_pg_min 40      // % mínima de verde em (R+G+B)
+#define verde_margem 8       // verde tem que passar R e B por essa margem (%)
+#define vermelho_pr_min 45   // % mínima de vermelho em (R+G+B)
+#define vermelho_margem 10   // vermelho tem que passar G e B por essa margem (%)
+
+// ================== OBJETOS E VARIÁVEIS ==================
+Servo servoE, servoD, servoGarra;
+
+Adafruit_TCS34725 sensorE = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_24MS, TCS34725_GAIN_4X);
+Adafruit_TCS34725 sensorD = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_24MS, TCS34725_GAIN_4X);
+
+enum Estado {
+  SEGUIR_LINHA,
+  CONFIRMA_COR,
+  PARADO_VERMELHO,
+  GIRANDO_ESQUERDA,
+  GIRANDO_DIREITA,
+  MEIA_VOLTA,
+  PASSANDO_FITA_REFLEXIVA,
+  DESVIANDO_OBSTACULO
+};
+
+Estado estadoAtual = SEGUIR_LINHA;
+enum DirecaoMemoria { NENHUMA, ESQ, DIR };
+DirecaoMemoria ultimaDirecao = NENHUMA;
+
+unsigned long tCor = 0;
+unsigned long tEstado = 0;
+unsigned long tCooldownCor = 0;     // [ALTERADO] antes era um único tCooldown
+unsigned long tCooldownPrata = 0;   // [NOVO]
+unsigned long tAmostraCor = 0;
+unsigned long tAmostraPrata = 0;    // [NOVO]
+
+int contadorFitaPrata = 0;
+int confirmacoesPrata = 0;
+int confirmacoesObstaculo = 0;
+int etapaDesvio = 0;
+int etapaGiro = 0;                  // [NOVO] 0 = girando, 1 = parada final
+const int intervaloCor = 70;
+
+int contVerdeE = 0;
+int contVerdeD = 0;
+int contVermelho = 0;
+
+bool viuVerdeE = false;
+bool viuVerdeD = false;
+bool viuVermelho = false;
+
+// ================== FUNÇÕES ==================
+
+void selecionarCanal(uint8_t canal) {
+  Wire.beginTransmission(endereco_multiplexador);
+  Wire.write(1 << canal);
+  Wire.endTransmission();
+}
+
+// ---------- LEITURA DO ULTRASSÔNICO ----------
+long lerDistanciaCM() {
+  digitalWrite(pino_trig, LOW);
+  delayMicroseconds(2);
+  digitalWrite(pino_trig, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(pino_trig, LOW);
+
+  long duracao = pulseIn(pino_echo, HIGH, 4000);
+  if (duracao == 0) return 999;
+  return duracao * 0.034 / 2;
+}
+
+// ---------- [NOVO] LEITURA DO A0 COM MÉDIA ----------
+int lerA0Media() {
+  long soma = 0;
+  for (int i = 0; i < amostras_media_a0; i++) {
+    soma += analogRead(pino_sensor_resgate);
+  }
+  return soma / amostras_media_a0;
+}
+
+// ---------- GARRA 360 COM DETACH ----------
+void abrirGarra() {
+  servoGarra.attach(pino_servo_garra);
+  servoGarra.write(180);
+  delay(600);
+  servoGarra.write(90);
+  delay(50);
+  servoGarra.detach();
+}
+
+void fecharGarra() {
+  servoGarra.attach(pino_servo_garra);
+  servoGarra.write(0);
+  delay(700);
+  servoGarra.write(90);
+  delay(50);
+  servoGarra.detach();
+}
+
+// ---------- MOVIMENTO ----------
+void frente() {
+  servoE.write(servo_esquerdo_frente);
+  servoD.write(servo_direito_frente);
+}
+void esquerda() {
+  servoE.write(servo_esquerdo_curva_tras);
+  servoD.write(servo_direito_curva_frente);
+}
+void direita() {
+  servoE.write(servo_esquerdo_curva_frente);
+  servoD.write(servo_direito_curva_tras);
+}
+void parar() {
+  servoE.write(servo_esquerdo_parado);
+  servoD.write(servo_direito_parado);
+}
+// [ALTERADO] agora usam velocidades próprias (ajustáveis lá em cima)
+void esquerda_linha() {
+  servoE.write(linha_esq_servoE);
+  servoD.write(linha_esq_servoD);
+}
+void direita_linha() {
+  servoE.write(linha_dir_servoE);
+  servoD.write(linha_dir_servoD);
+}
+
+// ---------- LEITURA DE COR ----------
+void limparCores() {
+  viuVerdeE = false;
+  viuVerdeD = false;
+  viuVermelho = false;
+}
+
+void lerBruto(Adafruit_TCS34725 &sensor, uint8_t canal,
+              uint16_t &c, uint16_t &r, uint16_t &g, uint16_t &b) {
+  selecionarCanal(canal);
+  c = sensor.read16(TCS34725_CDATAL);
+  r = sensor.read16(TCS34725_RDATAL);
+  g = sensor.read16(TCS34725_GDATAL);
+  b = sensor.read16(TCS34725_BDATAL);
+}
+
+// [ALTERADO] classificação por proporção em vez de margens absolutas
+void lerSensorCorRapido(Adafruit_TCS34725 &sensor, uint8_t canal, bool &verde, bool &vermelho) {
+  uint16_t c, r, g, b;
+  lerBruto(sensor, canal, c, r, g, b);
+
+  // Preto (escuro demais) ou branco (claro demais): não é cor
+  if (c < c_min_cor || c > c_max_cor) return;
+
+  uint32_t soma = (uint32_t)r + g + b;
+  if (soma == 0) return;
+
+  uint8_t pr = r * 100UL / soma;
+  uint8_t pg = g * 100UL / soma;
+  uint8_t pb = b * 100UL / soma;
+
+  if (pg >= verde_pg_min && pg >= pr + verde_margem && pg >= pb + verde_margem) {
+    verde = true;
+    return;
+  }
+
+  if (pr >= vermelho_pr_min && pr >= pg + vermelho_margem && pr >= pb + vermelho_margem) {
+    vermelho = true;
+    return;
+  }
+}
+
+void atualizarCores() {
+  limparCores();
+  lerSensorCorRapido(sensorE, canal_esquerdo, viuVerdeE, viuVermelho);
+  lerSensorCorRapido(sensorD, canal_direito, viuVerdeD, viuVermelho);
+}
+
+// ---------- [NOVO] MODO DEBUG (CALIBRAÇÃO) ----------
+void imprimirSensorCor(const char *nome, Adafruit_TCS34725 &sensor, uint8_t canal) {
+  uint16_t c, r, g, b;
+  lerBruto(sensor, canal, c, r, g, b);
+  uint32_t soma = (uint32_t)r + g + b;
+  if (soma == 0) soma = 1;
+
+  Serial.print(nome);
+  Serial.print(F(" C="));   Serial.print(c);
+  Serial.print(F(" R%="));  Serial.print(r * 100UL / soma);
+  Serial.print(F(" G%="));  Serial.print(g * 100UL / soma);
+  Serial.print(F(" B%="));  Serial.print(b * 100UL / soma);
+  Serial.print(F(" | "));
+}
+
+void modoDebug() {
+  static unsigned long tDebug = 0;
+  parar();
+  if (millis() - tDebug < 300) return;
+  tDebug = millis();
+
+  imprimirSensorCor("ESQ", sensorE, canal_esquerdo);
+  imprimirSensorCor("DIR", sensorD, canal_direito);
+  Serial.print(F("A0="));    Serial.print(lerA0Media());
+  Serial.print(F(" E1="));   Serial.print(digitalRead(E1));
+  Serial.print(F(" D1="));   Serial.print(digitalRead(D1));
+  Serial.print(F(" dist=")); Serial.println(lerDistanciaCM());
+}
+
+// ---------- SEGUE LINHA REATIVO ----------
+void seguirLinha() {
+  bool sE1 = digitalRead(E1);
+  bool sD1 = digitalRead(D1);
+
+  if (sE1 && sD1) {
+    // [ALTERADO] cruzamento sem verde: segue reto
+    if (cruzamento_segue_reto) {
+      frente();
+      return;
+    }
+    if (ultimaDirecao == ESQ) {
+      esquerda_linha();
+      return;
+    }
+    else if (ultimaDirecao == DIR) {
+      direita_linha();
+      return;
+    }
+    else {
+      frente();
+      return;
+    }
+  }
+
+  if (sD1) {
+    direita_linha();
+    ultimaDirecao = DIR;
+    return;
+  }
+
+  if (sE1) {
+    esquerda_linha();
+    ultimaDirecao = ESQ;
+    return;
+  }
+
+  frente();
+  ultimaDirecao = NENHUMA;
+}
+
+// ---------- [NOVO] AUXILIARES DE GIRO ----------
+void iniciarGiro(Estado novoEstado) {
+  estadoAtual = novoEstado;
+  etapaGiro = 0;
+  tEstado = millis();
+}
+
+void voltarASeguirLinha() {
+  limparCores();
+  ultimaDirecao = NENHUMA;
+  tCooldownCor = millis();   // as cores ficam "cegas" enquanto o robô sai do verde
+  estadoAtual = SEGUIR_LINHA;
+}
+
+// Gira "às cegas" por tCego, depois continua até o sensor de linha do lado
+// do giro achar o preto (ou até tMax). Em seguida para e volta a seguir linha.
+void executarGiro(bool paraEsquerda, unsigned long tCego, unsigned long tMax) {
+  unsigned long dt = millis() - tEstado;
+
+  if (etapaGiro == 0) {
+    if (paraEsquerda) esquerda(); else direita();
+
+    if (dt >= tCego) {
+      bool achouLinha = paraEsquerda ? digitalRead(E1) : digitalRead(D1);
+      if (achouLinha || dt >= tMax) {
+        etapaGiro = 1;
+        tEstado = millis();
+      }
+    }
+  }
+  else {
+    parar();
+    if (dt >= tempo_parada) {
+      voltarASeguirLinha();
+    }
+  }
+}
+
+// ---------- MÁQUINA DE ESTADOS ----------
+void atualizarEstado() {
+  switch (estadoAtual) {
+
+    case SEGUIR_LINHA: {
+      seguirLinha();
+
+      bool sE1 = digitalRead(E1);
+      bool sD1 = digitalRead(D1);
+
+      // [ALTERADO] prata: cooldown próprio, média e amostras espaçadas
+      if (!sE1 && !sD1 && (millis() - tCooldownPrata > tempo_cego_prata)) {
+        if (millis() - tAmostraPrata >= intervalo_amostra_prata) {
+          tAmostraPrata = millis();
+          int leituraA0 = lerA0Media();
+
+          if (leituraA0 > 5 && leituraA0 <= limiar_a0_prata) {
+            confirmacoesPrata++;
+            if (confirmacoesPrata >= leituras_minimas_prata) {
+              confirmacoesPrata = 0;
+              estadoAtual = PASSANDO_FITA_REFLEXIVA;
+              tEstado = millis();
+              contadorFitaPrata++;
+              return;
+            }
+          } else {
+            confirmacoesPrata = 0;
+          }
+        }
+      }
+
+      if (viuVermelho || viuVerdeE || viuVerdeD) {
+        contVerdeE = 0;
+        contVerdeD = 0;
+        contVermelho = 0;
+        tEstado = millis();
+        tAmostraCor = millis();
+        estadoAtual = CONFIRMA_COR;
+      }
+      break;
+    }
+
+    case CONFIRMA_COR: {
+      unsigned long dt = millis() - tEstado;
+
+      // [NOVO] avança um pouco antes de parar, para o segundo sensor
+      // também chegar em cima do verde (caso da meia-volta)
+      if (dt < tempo_avanco_cor) {
+        frente();
+        break;
+      }
+      parar();
+
+      if (dt >= tempo_avanco_cor + 150 && (millis() - tAmostraCor >= intervalo_amostra_cor)) {
+        tAmostraCor = millis();
+        atualizarCores();
+
+        if (viuVermelho) contVermelho++;
+        if (viuVerdeE)   contVerdeE++;
+        if (viuVerdeD)   contVerdeD++;
+      }
+
+      if (dt >= tempo_avanco_cor + tempo_confirmar_cor) {
+        if (contVermelho >= leituras_minimas_cor) {
+          estadoAtual = PARADO_VERMELHO;
+          tEstado = millis();
+        }
+        else if (contVerdeE >= leituras_minimas_cor && contVerdeD >= leituras_minimas_cor) {
+          iniciarGiro(MEIA_VOLTA);
+        }
+        else if (contVerdeE >= leituras_minimas_cor) {
+          iniciarGiro(GIRANDO_ESQUERDA);
+        }
+        else if (contVerdeD >= leituras_minimas_cor) {
+          iniciarGiro(GIRANDO_DIREITA);
+        }
+        else {
+          // Falso alarme: só as cores entram em cooldown, a prata continua ativa
+          limparCores();
+          tCooldownCor = millis();
+          estadoAtual = SEGUIR_LINHA;
+        }
+      }
+      break;
+    }
+
+    case DESVIANDO_OBSTACULO:
+      switch (etapaDesvio) {
+        case 0:
+          parar();
+          if (millis() - tEstado >= 300) { etapaDesvio = 1; tEstado = millis(); }
+          break;
+
+        case 1:
+          if (millis() - tEstado < tempo_desvio_giro_90) direita();
+          else if (millis() - tEstado < tempo_desvio_giro_90 + tempo_parada) parar();
+          else { etapaDesvio = 2; tEstado = millis(); }
+          break;
+
+        case 2:
+          if (millis() - tEstado < tempo_desvio_lado) frente();
+          else if (millis() - tEstado < tempo_desvio_lado + tempo_parada) parar();
+          else { etapaDesvio = 3; tEstado = millis(); }
+          break;
+
+        case 3:
+          if (millis() - tEstado < tempo_desvio_giro_90) esquerda();
+          else if (millis() - tEstado < tempo_desvio_giro_90 + tempo_parada) parar();
+          else { etapaDesvio = 4; tEstado = millis(); }
+          break;
+
+        case 4:
+          if (millis() - tEstado < tempo_desvio_frente) frente();
+          else if (millis() - tEstado < tempo_desvio_frente + tempo_parada) parar();
+          else { etapaDesvio = 5; tEstado = millis(); }
+          break;
+
+        case 5:
+          if (millis() - tEstado < tempo_desvio_giro_90) esquerda();
+          else if (millis() - tEstado < tempo_desvio_giro_90 + tempo_parada) parar();
+          else { etapaDesvio = 6; tEstado = millis(); }
+          break;
+
+        case 6:
+          // Obs.: se estourar o tempo sem achar a linha, o robô continua
+          // a sequência mesmo assim (igual à versão anterior).
+          frente();
+          if (digitalRead(E1) || digitalRead(D1) || (millis() - tEstado > tempo_busca_linha_max)) {
+            etapaDesvio = 7;
+            tEstado = millis();
+          }
+          break;
+
+        case 7:   // avança um pouco para passar por cima da linha
+          frente();
+          if (millis() - tEstado >= 150) { etapaDesvio = 8; tEstado = millis(); }
+          break;
+
+        case 8:
+          parar();
+          if (millis() - tEstado >= tempo_parada) { etapaDesvio = 9; tEstado = millis(); }
+          break;
+
+        case 9: { // [ALTERADO] gira p/ direita; termina antes se D1 achar a linha
+          unsigned long dt = millis() - tEstado;
+          direita();
+          if (dt >= tempo_giro_cego_90 && (digitalRead(D1) || dt >= tempo_desvio_giro_90)) {
+            etapaDesvio = 10;
+            tEstado = millis();
+          }
+          break;
+        }
+
+        case 10:
+          parar();
+          if (millis() - tEstado >= tempo_parada) {
+            voltarASeguirLinha();
+          }
+          break;
+      }
+      break;
+
+    // [ALTERADO] giros agora terminam no sensor de linha
+    case GIRANDO_ESQUERDA:
+      executarGiro(true, tempo_giro_cego_90, tempo_giro_max_90);
+      break;
+
+    case GIRANDO_DIREITA:
+      executarGiro(false, tempo_giro_cego_90, tempo_giro_max_90);
+      break;
+
+    case MEIA_VOLTA:
+      executarGiro(false, tempo_giro_cego_180, tempo_giro_max_180);
+      break;
+
+    case PASSANDO_FITA_REFLEXIVA:
+      if (millis() - tEstado < 500) {
+        parar();
+      }
+      else if (millis() - tEstado < 500 + delay_fita_reflexiva) {
+        frente();
+      }
+      else {
+        parar();
+
+        if (contadorFitaPrata == 1) {
+          abrirGarra();
+        }
+        else if (contadorFitaPrata >= 2) {
+          fecharGarra();
+        }
+
+        limparCores();
+        tCooldownCor = millis();
+        tCooldownPrata = millis();
+        estadoAtual = SEGUIR_LINHA;
+      }
+      break;
+
+    case PARADO_VERMELHO:
+      if (millis() - tEstado < 5000) {
+        parar();
+      } else if (millis() - tEstado < 5000 + tempo_escapar_verde) {
+        frente();
+      } else if (millis() - tEstado < 5000 + tempo_escapar_verde + tempo_parada) {
+        parar();
+      } else {
+        limparCores();
+        tCooldownCor = millis();
+        estadoAtual = SEGUIR_LINHA;
+      }
+      break;
+  }
+}
+
+// ================== SETUP ==================
+void setup() {
+  Serial.begin(9600);
+  Wire.begin();
+
+  // [NOVO] evita travar o robô se o I2C falhar (precisa do core AVR 1.8.13+)
+#if defined(WIRE_HAS_TIMEOUT)
+  Wire.setWireTimeout(3000, true);
+#endif
+
+  servoE.attach(pino_servo_esquerdo);
+  servoD.attach(pino_servo_direito);
+  parar();
+
+  pinMode(E1, INPUT);
+  pinMode(D1, INPUT);
+
+  pinMode(pino_trig, OUTPUT);
+  pinMode(pino_echo, INPUT);
+
+  // [NOVO] avisa se algum sensor de cor não responder
+  selecionarCanal(canal_esquerdo);
+  if (!sensorE.begin()) {
+    Serial.println(F("ERRO: sensor de cor ESQUERDO nao encontrado"));
+  }
+
+  selecionarCanal(canal_direito);
+  if (!sensorD.begin()) {
+    Serial.println(F("ERRO: sensor de cor DIREITO nao encontrado"));
+  }
+
+  Serial.println(F("ROBO INICIADO"));
+#if MODO_DEBUG
+  Serial.println(F("MODO DEBUG: robo parado, imprimindo leituras"));
+#endif
+
+  delay(2000);
+  tCooldownCor = millis();
+  tCooldownPrata = millis();
+}
+
+// ================== LOOP ==================
+void loop() {
+#if MODO_DEBUG
+  modoDebug();
+  return;
+#endif
+
+  if (estadoAtual == SEGUIR_LINHA && (millis() - tCor > intervaloCor)) {
+    tCor = millis();
+
+    long dist = lerDistanciaCM();
+    if (dist >= 2 && dist <= distancia_obstaculo) {
+      confirmacoesObstaculo++;
+      if (confirmacoesObstaculo >= 2) {
+        confirmacoesObstaculo = 0;
+        etapaDesvio = 0;
+        estadoAtual = DESVIANDO_OBSTACULO;
+        tEstado = millis();
+      }
+    } else {
+      confirmacoesObstaculo = 0;
+    }
+
+    if (estadoAtual == SEGUIR_LINHA && !digitalRead(E1) && !digitalRead(D1) && (millis() - tCooldownCor > tempo_cego_cores)) {
+      atualizarCores();
+    }
+  }
+
+  atualizarEstado();
+}
