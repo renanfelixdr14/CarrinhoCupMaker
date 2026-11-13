@@ -3,17 +3,18 @@
 #include <Servo.h>
 
 // =====================================================================
-//  MUDANÇAS EM RELAÇÃO À VERSÃO ANTERIOR (procure por [NOVO] / [ALTERADO])
-//  1. Prata: média de leituras do A0 + confirmações espaçadas no tempo
-//  2. Verde/vermelho: detecção por proporção (%) e descarte do preto
-//  3. Cooldowns separados para cores e para prata
-//  4. Avanço curto após ver a primeira cor (ajuda a pegar os 2 verdes)
-//  5. Cruzamento sem verde (E1 e D1 no preto): segue reto (configurável)
-//  6. Giros terminam quando o sensor de linha acha o preto (com tempo máximo)
-//  7. Timeout no I2C, checagem dos sensores de cor e MODO_DEBUG p/ calibrar
+//  MUDANÇAS DESTA VERSÃO (procure por [v3])
+//  1. Seguir linha com correção gradual: começa virando de leve e só
+//     aumenta se o sensor continuar no preto (3 níveis). Assim que o
+//     sensor sai do preto, para de virar e a próxima correção começa
+//     de novo pelo nível leve.
+//  2. Enquanto algum sensor de linha está no preto (robô virando), o
+//     ultrassônico e os sensores de cor não são lidos: o loop fica só
+//     lendo E1/D1, sem nenhuma espera.
+//  3. Removido o #define limiar_a0_prata duplicado.
 // =====================================================================
 
-// [NOVO] Coloque 1 para calibrar: o robô fica parado e imprime as leituras
+// Coloque 1 para calibrar: o robô fica parado e imprime as leituras
 #define MODO_DEBUG 0
 
 // ================== CONFIGURAÇÕES ==================
@@ -31,25 +32,32 @@
 #define servo_direito_tras 102
 #define servo_direito_parado 90
 
-// --- VELOCIDADE PARA CURVAS (giros de 90/180 e desvio) ---
+// --- VELOCIDADE PARA CURVAS (giros do verde e desvio) ---
 #define servo_esquerdo_curva_frente 135
 #define servo_esquerdo_curva_tras 45
 
 #define servo_direito_curva_frente 45
 #define servo_direito_curva_tras 135
 
-// --- [NOVO] VELOCIDADE DAS CORREÇÕES AO SEGUIR LINHA ---
-// Começam iguais às de curva (comportamento idêntico ao anterior).
-// Para um seguimento mais suave, teste deixar a roda de dentro parada:
-//   linha_esq_servoE 90  /  linha_dir_servoD 90
-#define linha_esq_servoE 45    // correção p/ esquerda: servo esquerdo
-#define linha_esq_servoD 45    // correção p/ esquerda: servo direito
-#define linha_dir_servoE 135   // correção p/ direita: servo esquerdo
-#define linha_dir_servoD 135   // correção p/ direita: servo direito
+// --- [v3] CORREÇÃO GRADUAL AO SEGUIR LINHA ---
+// Velocidades em "graus a partir do parado": positivo = para frente,
+// negativo = para trás. Para comparar: andando reto, o esquerdo usa 10
+// e o direito 12.
+// Nível 1 - curva suave: roda de dentro parada
+#define n1_fora 12
+#define n1_dentro 0
+// Nível 2 - curva média: roda de dentro para trás, devagar
+#define n2_fora 15
+#define n2_dentro -8
+// Nível 3 - curva fechada: gira no lugar
+#define n3_fora 20
+#define n3_dentro -20
+// Tempo com o sensor no preto para subir de nível (ms)
+#define tempo_nivel_2 80
+#define tempo_nivel_3 200
 
-// [NOVO] true = segue reto quando E1 e D1 veem preto juntos (regra da OBR
-// para cruzamento sem verde). false = comportamento antigo (vira para o
-// lado da última correção).
+// true = segue reto quando E1 e D1 veem preto juntos (regra da OBR
+// para cruzamento sem verde). false = vira para o lado da última correção.
 #define cruzamento_segue_reto true
 
 // --- SERVO DA GARRA (360 GRAUS) ---
@@ -67,22 +75,22 @@
 #define tempo_busca_linha_max 2500
 
 // --- TEMPOS DE CONFIRMAÇÃO DE COR ---
-#define tempo_avanco_cor 80          // [NOVO] anda mais um pouco após ver a 1ª cor (0 desliga)
+#define tempo_avanco_cor 80          // anda mais um pouco após ver a 1ª cor (0 desliga)
 #define tempo_confirmar_cor 750      // Tempo (ms) parado em cima da cor confirmando
 #define intervalo_amostra_cor 100
 #define leituras_minimas_cor 3
 
-// --- [ALTERADO] GIROS: tempo "cego" + giro até achar a linha + tempo máximo ---
-#define tempo_giro_cego_90 250       // gira sem olhar o sensor (sai da linha atual)
-#define tempo_giro_max_90 600        // segurança: para mesmo sem achar a linha (antes: 480 fixo)
-#define tempo_giro_cego_180 800      // passa pelas linhas laterais sem parar nelas
-#define tempo_giro_max_180 1400      // segurança (antes: 1100 fixo)
+// --- GIROS DO VERDE: tempo "cego" + giro até achar a linha + tempo máximo ---
+#define tempo_giro_cego_90 250
+#define tempo_giro_max_90 600
+#define tempo_giro_cego_180 800
+#define tempo_giro_max_180 1400
 
 // --- TEMPOS E DELAYS GERAIS ---
 #define tempo_parada 200
 #define tempo_escapar_verde 250      // usado para sair de cima do vermelho
 #define tempo_cego_cores 1000        // cooldown das cores
-#define tempo_cego_prata 1000        // [NOVO] cooldown da prata (independente)
+#define tempo_cego_prata 1000        // cooldown da prata
 #define delay_fita_reflexiva 800
 
 // --- PINOS DOS SENSORES DE LINHA E RESGATE ---
@@ -95,22 +103,19 @@
 #define canal_direito 0
 
 // --- PRATA (A0) ---
-// Fita Prata = 23 | Branco/Cores = 27 a 29
-// ATENÇÃO: essa diferença é muito pequena. Se puder, ajuste a altura do
-// sensor / resistor para o branco ficar perto do meio da faixa (300 a 600)
-// e recalibre este limiar com o MODO_DEBUG.
-#define limiar_a0_prata 24
-#define amostras_media_a0 8          // [NOVO] leituras por média
-#define intervalo_amostra_prata 10   // [NOVO] ms entre confirmações
-#define leituras_minimas_prata 4     // [NOVO] confirmações seguidas (antes: 3 instantâneas)
+#define amostras_media_a0 8          // leituras por média
+#define intervalo_amostra_prata 10   // ms entre confirmações
+#define leituras_minimas_prata 4     // confirmações seguidas
 
-// --- [NOVO] LIMITES DE COR (calibrar com MODO_DEBUG) ---
-#define c_min_cor 150        // C abaixo disso = preto, ignora
-#define c_max_cor 650        // C acima disso = branco, ignora
-#define verde_pg_min 40      // % mínima de verde em (R+G+B)
-#define verde_margem 8       // verde tem que passar R e B por essa margem (%)
-#define vermelho_pr_min 45   // % mínima de vermelho em (R+G+B)
-#define vermelho_margem 10   // vermelho tem que passar G e B por essa margem (%)
+// --- LIMITES DE COR E A0 (gerados pelo código de calibração) ---
+#define c_min_cor 279
+#define c_max_cor 892
+#define verde_pg_min 36
+#define verde_margem 1
+#define vermelho_pr_min 33
+#define vermelho_margem 1
+#define limiar_a0_prata 25
+#define limiar_a0_preto 21
 
 // ================== OBJETOS E VARIÁVEIS ==================
 Servo servoE, servoD, servoGarra;
@@ -132,19 +137,21 @@ enum Estado {
 Estado estadoAtual = SEGUIR_LINHA;
 enum DirecaoMemoria { NENHUMA, ESQ, DIR };
 DirecaoMemoria ultimaDirecao = NENHUMA;
+DirecaoMemoria ladoCorrecao = NENHUMA;   // [v3] lado da correção em andamento
+unsigned long tInicioCorrecao = 0;       // [v3] quando o sensor entrou no preto
 
 unsigned long tCor = 0;
 unsigned long tEstado = 0;
-unsigned long tCooldownCor = 0;     // [ALTERADO] antes era um único tCooldown
-unsigned long tCooldownPrata = 0;   // [NOVO]
+unsigned long tCooldownCor = 0;
+unsigned long tCooldownPrata = 0;
 unsigned long tAmostraCor = 0;
-unsigned long tAmostraPrata = 0;    // [NOVO]
+unsigned long tAmostraPrata = 0;
 
 int contadorFitaPrata = 0;
 int confirmacoesPrata = 0;
 int confirmacoesObstaculo = 0;
 int etapaDesvio = 0;
-int etapaGiro = 0;                  // [NOVO] 0 = girando, 1 = parada final
+int etapaGiro = 0;                  // 0 = girando, 1 = parada final
 const int intervaloCor = 70;
 
 int contVerdeE = 0;
@@ -176,7 +183,7 @@ long lerDistanciaCM() {
   return duracao * 0.034 / 2;
 }
 
-// ---------- [NOVO] LEITURA DO A0 COM MÉDIA ----------
+// ---------- LEITURA DO A0 COM MÉDIA ----------
 int lerA0Media() {
   long soma = 0;
   for (int i = 0; i < amostras_media_a0; i++) {
@@ -221,14 +228,33 @@ void parar() {
   servoE.write(servo_esquerdo_parado);
   servoD.write(servo_direito_parado);
 }
-// [ALTERADO] agora usam velocidades próprias (ajustáveis lá em cima)
-void esquerda_linha() {
-  servoE.write(linha_esq_servoE);
-  servoD.write(linha_esq_servoD);
+
+// [v3] Velocidade de cada roda: positivo = frente, negativo = trás
+void rodas(int vE, int vD) {
+  servoE.write(servo_esquerdo_parado + vE);
+  servoD.write(servo_direito_parado - vD);
 }
-void direita_linha() {
-  servoE.write(linha_dir_servoE);
-  servoD.write(linha_dir_servoD);
+
+// [v3] Correção gradual: quanto mais tempo o sensor fica no preto,
+// mais forte a curva. Chamada a cada volta do loop, sem espera.
+void corrigir(bool paraEsquerda) {
+  DirecaoMemoria lado = paraEsquerda ? ESQ : DIR;
+
+  if (ladoCorrecao != lado) {      // começou agora (ou trocou de lado)
+    ladoCorrecao = lado;
+    tInicioCorrecao = millis();
+  }
+
+  unsigned long dt = millis() - tInicioCorrecao;
+  int fora, dentro;
+  if (dt < tempo_nivel_2)      { fora = n1_fora; dentro = n1_dentro; }
+  else if (dt < tempo_nivel_3) { fora = n2_fora; dentro = n2_dentro; }
+  else                         { fora = n3_fora; dentro = n3_dentro; }
+
+  if (paraEsquerda) rodas(dentro, fora);   // virando p/ esquerda: a roda esquerda é a de dentro
+  else              rodas(fora, dentro);
+
+  ultimaDirecao = lado;
 }
 
 // ---------- LEITURA DE COR ----------
@@ -247,7 +273,6 @@ void lerBruto(Adafruit_TCS34725 &sensor, uint8_t canal,
   b = sensor.read16(TCS34725_BDATAL);
 }
 
-// [ALTERADO] classificação por proporção em vez de margens absolutas
 void lerSensorCorRapido(Adafruit_TCS34725 &sensor, uint8_t canal, bool &verde, bool &vermelho) {
   uint16_t c, r, g, b;
   lerBruto(sensor, canal, c, r, g, b);
@@ -279,7 +304,7 @@ void atualizarCores() {
   lerSensorCorRapido(sensorD, canal_direito, viuVerdeD, viuVermelho);
 }
 
-// ---------- [NOVO] MODO DEBUG (CALIBRAÇÃO) ----------
+// ---------- MODO DEBUG (CALIBRAÇÃO) ----------
 void imprimirSensorCor(const char *nome, Adafruit_TCS34725 &sensor, uint8_t canal) {
   uint16_t c, r, g, b;
   lerBruto(sensor, canal, c, r, g, b);
@@ -308,48 +333,35 @@ void modoDebug() {
   Serial.print(F(" dist=")); Serial.println(lerDistanciaCM());
 }
 
-// ---------- SEGUE LINHA REATIVO ----------
+// ---------- [v3] SEGUE LINHA COM CORREÇÃO GRADUAL ----------
 void seguirLinha() {
   bool sE1 = digitalRead(E1);
   bool sD1 = digitalRead(D1);
 
   if (sE1 && sD1) {
-    // [ALTERADO] cruzamento sem verde: segue reto
+    // Cruzamento sem verde
     if (cruzamento_segue_reto) {
+      ladoCorrecao = NENHUMA;
       frente();
       return;
     }
-    if (ultimaDirecao == ESQ) {
-      esquerda_linha();
-      return;
-    }
-    else if (ultimaDirecao == DIR) {
-      direita_linha();
-      return;
-    }
-    else {
-      frente();
-      return;
-    }
-  }
-
-  if (sD1) {
-    direita_linha();
-    ultimaDirecao = DIR;
+    if (ultimaDirecao == ESQ) { corrigir(true);  return; }
+    if (ultimaDirecao == DIR) { corrigir(false); return; }
+    ladoCorrecao = NENHUMA;
+    frente();
     return;
   }
 
-  if (sE1) {
-    esquerda_linha();
-    ultimaDirecao = ESQ;
-    return;
-  }
+  if (sD1) { corrigir(false); return; }
+  if (sE1) { corrigir(true);  return; }
 
+  // Os dois no branco: linha centralizada, a próxima correção recomeça leve
+  ladoCorrecao = NENHUMA;
   frente();
   ultimaDirecao = NENHUMA;
 }
 
-// ---------- [NOVO] AUXILIARES DE GIRO ----------
+// ---------- AUXILIARES DE GIRO (VERDE) ----------
 void iniciarGiro(Estado novoEstado) {
   estadoAtual = novoEstado;
   etapaGiro = 0;
@@ -359,7 +371,8 @@ void iniciarGiro(Estado novoEstado) {
 void voltarASeguirLinha() {
   limparCores();
   ultimaDirecao = NENHUMA;
-  tCooldownCor = millis();   // as cores ficam "cegas" enquanto o robô sai do verde
+  ladoCorrecao = NENHUMA;    // [v3]
+  tCooldownCor = millis();
   estadoAtual = SEGUIR_LINHA;
 }
 
@@ -397,13 +410,13 @@ void atualizarEstado() {
       bool sE1 = digitalRead(E1);
       bool sD1 = digitalRead(D1);
 
-      // [ALTERADO] prata: cooldown próprio, média e amostras espaçadas
+      // Prata: só é procurada com os dois sensores de linha no branco
       if (!sE1 && !sD1 && (millis() - tCooldownPrata > tempo_cego_prata)) {
         if (millis() - tAmostraPrata >= intervalo_amostra_prata) {
           tAmostraPrata = millis();
           int leituraA0 = lerA0Media();
 
-          if (leituraA0 > 5 && leituraA0 <= limiar_a0_prata) {
+          if (leituraA0 > limiar_a0_preto && leituraA0 <= limiar_a0_prata) {
             confirmacoesPrata++;
             if (confirmacoesPrata >= leituras_minimas_prata) {
               confirmacoesPrata = 0;
@@ -432,7 +445,7 @@ void atualizarEstado() {
     case CONFIRMA_COR: {
       unsigned long dt = millis() - tEstado;
 
-      // [NOVO] avança um pouco antes de parar, para o segundo sensor
+      // Avança um pouco antes de parar, para o segundo sensor
       // também chegar em cima do verde (caso da meia-volta)
       if (dt < tempo_avanco_cor) {
         frente();
@@ -511,8 +524,6 @@ void atualizarEstado() {
           break;
 
         case 6:
-          // Obs.: se estourar o tempo sem achar a linha, o robô continua
-          // a sequência mesmo assim (igual à versão anterior).
           frente();
           if (digitalRead(E1) || digitalRead(D1) || (millis() - tEstado > tempo_busca_linha_max)) {
             etapaDesvio = 7;
@@ -530,7 +541,7 @@ void atualizarEstado() {
           if (millis() - tEstado >= tempo_parada) { etapaDesvio = 9; tEstado = millis(); }
           break;
 
-        case 9: { // [ALTERADO] gira p/ direita; termina antes se D1 achar a linha
+        case 9: { // gira p/ direita; termina antes se D1 achar a linha
           unsigned long dt = millis() - tEstado;
           direita();
           if (dt >= tempo_giro_cego_90 && (digitalRead(D1) || dt >= tempo_desvio_giro_90)) {
@@ -549,7 +560,6 @@ void atualizarEstado() {
       }
       break;
 
-    // [ALTERADO] giros agora terminam no sensor de linha
     case GIRANDO_ESQUERDA:
       executarGiro(true, tempo_giro_cego_90, tempo_giro_max_90);
       break;
@@ -607,7 +617,7 @@ void setup() {
   Serial.begin(9600);
   Wire.begin();
 
-  // [NOVO] evita travar o robô se o I2C falhar (precisa do core AVR 1.8.13+)
+  // Evita travar o robô se o I2C falhar (precisa do core AVR 1.8.13+)
 #if defined(WIRE_HAS_TIMEOUT)
   Wire.setWireTimeout(3000, true);
 #endif
@@ -622,7 +632,6 @@ void setup() {
   pinMode(pino_trig, OUTPUT);
   pinMode(pino_echo, INPUT);
 
-  // [NOVO] avisa se algum sensor de cor não responder
   selecionarCanal(canal_esquerdo);
   if (!sensorE.begin()) {
     Serial.println(F("ERRO: sensor de cor ESQUERDO nao encontrado"));
@@ -650,7 +659,11 @@ void loop() {
   return;
 #endif
 
-  if (estadoAtual == SEGUIR_LINHA && (millis() - tCor > intervaloCor)) {
+  // [v3] Com algum sensor de linha no preto o robô está virando:
+  // pula o ultrassônico e as cores para o loop só ler E1/D1, sem espera.
+  bool virando = digitalRead(E1) || digitalRead(D1);
+
+  if (estadoAtual == SEGUIR_LINHA && !virando && (millis() - tCor > intervaloCor)) {
     tCor = millis();
 
     long dist = lerDistanciaCM();
@@ -666,7 +679,7 @@ void loop() {
       confirmacoesObstaculo = 0;
     }
 
-    if (estadoAtual == SEGUIR_LINHA && !digitalRead(E1) && !digitalRead(D1) && (millis() - tCooldownCor > tempo_cego_cores)) {
+    if (estadoAtual == SEGUIR_LINHA && (millis() - tCooldownCor > tempo_cego_cores)) {
       atualizarCores();
     }
   }
